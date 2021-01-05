@@ -7,6 +7,8 @@ module JSONAPI
 
     attr_writer :allow_include
 
+    attr_accessor :_routed, :_warned_missing_route
+
     def initialize(name, options = {})
       @name = name.to_s
       @options = options
@@ -27,7 +29,12 @@ module JSONAPI
       @class_name = nil
       @inverse_relationship = nil
 
-      # Custom methods are reserved for use in resource finders. Not used in the default ActiveRelationResourceFinder
+      @_routed = false
+      @_warned_missing_route = false
+
+      exclude_links(options.fetch(:exclude_links, JSONAPI.configuration.default_exclude_links))
+
+      # Custom methods are reserved for future use
       @custom_methods = options.fetch(:custom_methods, {})
     end
 
@@ -99,6 +106,27 @@ module JSONAPI
       @options[:readonly]
     end
 
+    def exclude_links(exclude)
+      case exclude
+        when :default, "default"
+          @_exclude_links = [:self, :related]
+        when :none, "none"
+          @_exclude_links = []
+        when Array
+          @_exclude_links = exclude.collect {|link| link.to_sym}
+        else
+          fail "Invalid exclude_links"
+      end
+    end
+
+    def _exclude_links
+      @_exclude_links ||= []
+    end
+
+    def exclude_link?(link)
+      _exclude_links.include?(link.to_sym)
+    end
+
     class ToOne < Relationship
       attr_reader :foreign_key_on
 
@@ -114,7 +142,7 @@ module JSONAPI
 
       def to_s
         # :nocov: useful for debugging
-        "#{parent_resource._type}.#{name} => (#{belongs_to? ? 'ToOne' : 'BelongsToOne'}) #{resource_klass._type}"
+        "#{parent_resource}.#{name}(#{belongs_to? ? 'BelongsToOne' : 'ToOne'})"
         # :nocov:
       end
 
@@ -164,7 +192,7 @@ module JSONAPI
 
       def to_s
         # :nocov: useful for debugging
-        "#{parent_resource._type}.#{name} => (ToMany) #{resource_klass._type}"
+        "#{parent_resource}.#{name}(ToMany)"
         # :nocov:
       end
 

@@ -101,6 +101,7 @@ module JSONAPI
                                        include_directives,
                                        find_options)
 
+      fail JSONAPI::Exceptions::RecordNotFound.new(id) if resource_set.resource_klasses.empty?
       resource_set.populate!(serializer, context, find_options)
 
       return JSONAPI::ResourceSetOperationResult.new(:ok, resource_set, result_options)
@@ -130,11 +131,11 @@ module JSONAPI
                                                        find_options,
                                                        nil)
 
-      return JSONAPI::LinksObjectOperationResult.new(:ok,
-                                                     parent_resource,
-                                                     resource_klass._relationship(relationship_type),
-                                                     resource_id_tree.fragments.keys,
-                                                     result_options)
+      return JSONAPI::RelationshipOperationResult.new(:ok,
+                                                      parent_resource,
+                                                      resource_klass._relationship(relationship_type),
+                                                      resource_id_tree.fragments.keys,
+                                                      result_options)
     end
 
     def show_related_resource
@@ -391,7 +392,7 @@ module JSONAPI
       primary_resource_id_tree = PrimaryResourceIdTree.new
       primary_resource_id_tree.add_resource_fragments(fragments, include_related)
 
-      load_included(resource_klass, primary_resource_id_tree, include_related, options.except(:filters, :sort_criteria))
+      load_included(resource_klass, primary_resource_id_tree, include_related, options)
 
       primary_resource_id_tree
     end
@@ -405,7 +406,7 @@ module JSONAPI
       primary_resource_id_tree = PrimaryResourceIdTree.new
       primary_resource_id_tree.add_resource_fragments(fragments, include_related)
 
-      load_included(resource_klass, primary_resource_id_tree, include_related, options.except(:filters, :sort_criteria))
+      load_included(resource_klass, primary_resource_id_tree, include_related, options)
 
       primary_resource_id_tree
     end
@@ -421,7 +422,7 @@ module JSONAPI
       primary_resource_id_tree = PrimaryResourceIdTree.new
       primary_resource_id_tree.add_resource_fragments(fragments, include_related)
 
-      load_included(resource_klass, primary_resource_id_tree, include_related, options.except(:filters, :sort_criteria))
+      load_included(resource_klass, primary_resource_id_tree, include_related, options)
 
       primary_resource_id_tree
     end
@@ -429,12 +430,11 @@ module JSONAPI
     def load_included(resource_klass, source_resource_id_tree, include_related, options)
       source_rids = source_resource_id_tree.fragments.keys
 
-      include_related.try(:each_pair) do |key, value|
-        next unless value[:include]
+      include_related.try(:each_key) do |key|
         relationship = resource_klass._relationship(key)
         relationship_name = relationship.name.to_sym
 
-        find_related_resource_options = options.dup
+        find_related_resource_options = options.except(:filters, :sort_criteria, :paginator)
         find_related_resource_options[:sort_criteria] = relationship.resource_klass.default_sort
         find_related_resource_options[:cache] = resource_klass.caching?
 

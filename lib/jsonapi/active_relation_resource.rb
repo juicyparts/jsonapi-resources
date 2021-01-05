@@ -1,13 +1,8 @@
-require 'jsonapi/active_relation_resource_finder/adapters/join_left_active_record_adapter'
-
 module JSONAPI
-  module ActiveRelationResourceFinder
-    def self.included(base)
-      base.extend ClassMethods
-    end
+  class ActiveRelationResource < BasicResource
+    root_resource
 
-    module ClassMethods
-
+    class << self
       # Finds Resources using the `filters`. Pagination and sort options are used when provided
       #
       # @param filters [Hash] the filters hash
@@ -19,9 +14,9 @@ module JSONAPI
       def find(filters, options = {})
         sort_criteria = options.fetch(:sort_criteria) { [] }
 
-        join_manager = JoinManager.new(resource_klass: self,
-                                    filters: filters,
-                                    sort_criteria: sort_criteria)
+        join_manager = ActiveRelation::JoinManager.new(resource_klass: self,
+                                                       filters: filters,
+                                                       sort_criteria: sort_criteria)
 
         paginator = options[:paginator]
 
@@ -41,8 +36,8 @@ module JSONAPI
       #
       # @return [Integer] the count
       def count(filters, options = {})
-        join_manager = JoinManager.new(resource_klass: self,
-                                    filters: filters)
+        join_manager = ActiveRelation::JoinManager.new(resource_klass: self,
+                                                       filters: filters)
 
         records = apply_request_settings_to_records(records: records(options),
                                filters: filters,
@@ -70,6 +65,16 @@ module JSONAPI
         resources_for(records, options[:context])
       end
 
+      # Returns an array of Resources identified by the `keys` array. The resources are not filtered as this
+      # will have been done in a prior step
+      #
+      # @param keys [Array<key>] Array of primary keys to find resources for
+      # @option options [Hash] :context The context of the request, set in the controller
+      def find_to_populate_by_keys(keys, options = {})
+        records = records_for_populate(options).where(_primary_key => keys)
+        resources_for(records, options[:context])
+      end
+
       # Finds Resource fragments using the `filters`. Pagination and sort options are used when provided.
       # Retrieving the ResourceIdentities and attributes does not instantiate a model instance.
       # Note: This is incompatible with Polymorphic resources (which are going to come from two separate tables)
@@ -91,11 +96,11 @@ module JSONAPI
 
         sort_criteria = options.fetch(:sort_criteria) { [] }
 
-        join_manager = JoinManager.new(resource_klass: resource_klass,
-                                    source_relationship: nil,
-                                    relationships: linkage_relationships,
-                                    sort_criteria: sort_criteria,
-                                    filters: filters)
+        join_manager = ActiveRelation::JoinManager.new(resource_klass: resource_klass,
+                                                       source_relationship: nil,
+                                                       relationships: linkage_relationships,
+                                                       sort_criteria: sort_criteria,
+                                                       filters: filters)
 
         paginator = options[:paginator]
 
@@ -148,9 +153,14 @@ module JSONAPI
           pluck_fields << Arel.sql("#{concat_table_field(resource_table_alias, model_field[:name])} AS #{resource_table_alias}_#{model_field[:name]}")
         end
 
+        sort_fields = options.dig(:_relation_helper_options, :sort_fields)
+        sort_fields.try(:each) do |field|
+          pluck_fields << Arel.sql(field)
+        end
+
         fragments = {}
-        rows = records.distinct.pluck(*pluck_fields)
-        rows.collect do |row|
+        rows = records.pluck(*pluck_fields)
+        rows.each do |row|
           rid = JSONAPI::ResourceIdentity.new(resource_klass, pluck_fields.length == 1 ? row : row[0])
 
           fragments[rid] ||= JSONAPI::ResourceFragment.new(rid)
@@ -174,6 +184,10 @@ module JSONAPI
           model_fields.each_with_index do |k, idx|
             fragments[rid].attributes[k[0]]= cast_to_attribute_type(row[idx + attributes_offset], k[1][:type])
           end
+        end
+
+        if JSONAPI.configuration.warn_on_performance_issues && (rows.length > fragments.length)
+          warn "Performance issue detected: `#{self.name.to_s}.records` returned non-normalized results in `#{self.name.to_s}.find_fragments`."
         end
 
         fragments
@@ -224,9 +238,9 @@ module JSONAPI
         filters = options.fetch(:filters, {})
 
         # Joins in this case are related to the related_klass
-        join_manager = JoinManager.new(resource_klass: self,
-                                    source_relationship: relationship,
-                                    filters: filters)
+        join_manager = ActiveRelation::JoinManager.new(resource_klass: self,
+                                                       source_relationship: relationship,
+                                                       filters: filters)
 
         records = apply_request_settings_to_records(records: records(options),
                                resource_klass: related_klass,
@@ -242,9 +256,56 @@ module JSONAPI
         count_records(records)
       end
 
-      def records(_options = {})
+      # This resource class (ActiveRelationResource) uses an `ActiveRecord::Relation` as the starting point for
+      # retrieving models. From this relation filters, sorts and joins are applied as needed.
+      # Depending on which phase of the request processing different `records` methods will be called, giving the user
+      # the opportunity to override them differently for performance and security reasons.
+
+      # begin `records`methods
+
+      # Base for the `records` methods that follow and is not directly used for accessing model data by this class.
+      # Overriding this method gives a single place to affect the `ActiveRecord::Relation` used for the resource.
+      #
+      # @option options [Hash] :context The context of the request, set in the controller
+      #
+      # @return [ActiveRecord::Relation]
+      def records_base(_options = {})
         _model_class.all
       end
+
+      # The `ActiveRecord::Relation` used for finding user requested models. This may be overridden to enforce
+      # permissions checks on the request.
+      #
+      # @option options [Hash] :context The context of the request, set in the controller
+      #
+      # @return [ActiveRecord::Relation]
+      def records(options = {})
+        records_base(options)
+      end
+
+      # The `ActiveRecord::Relation` used for populating the ResourceSet. Only resources that have been previously
+      # identified through the `records` method will be accessed. Thus it should not be necessary to reapply permissions
+      # checks. However if the model needs to include other models adding `includes` is appropriate
+      #
+      # @option options [Hash] :context The context of the request, set in the controller
+      #
+      # @return [ActiveRecord::Relation]
+      def records_for_populate(options = {})
+        records_base(options)
+      end
+
+      # The `ActiveRecord::Relation` used for the finding related resources. Only resources that have been previously
+      # identified through the `records` method will be accessed and used as the basis to find related resources. Thus
+      # it should not be necessary to reapply permissions checks.
+      #
+      # @option options [Hash] :context The context of the request, set in the controller
+      #
+      # @return [ActiveRecord::Relation]
+      def records_for_source_to_related(options = {})
+        records_base(options)
+      end
+
+      # end `records` methods
 
       def apply_join(records:, relationship:, resource_type:, join_type:, options:)
         if relationship.polymorphic? && relationship.belongs_to?
@@ -267,7 +328,7 @@ module JSONAPI
       end
 
       def relationship_records(relationship:, join_type: :inner, resource_type: nil, options: {})
-        records = relationship.parent_resource.records(options)
+        records = relationship.parent_resource.records_for_source_to_related(options)
         strategy = relationship.options[:apply_join]
 
         if strategy
@@ -328,15 +389,15 @@ module JSONAPI
           sort_criteria << { field: field, direction: sort[:direction] }
         end
 
-        join_manager = JoinManager.new(resource_klass: self,
-                                    source_relationship: relationship,
-                                    relationships: linkage_relationships,
-                                    sort_criteria: sort_criteria,
-                                    filters: filters)
+        join_manager = ActiveRelation::JoinManager.new(resource_klass: self,
+                                                       source_relationship: relationship,
+                                                       relationships: linkage_relationships,
+                                                       sort_criteria: sort_criteria,
+                                                       filters: filters)
 
-        paginator = options[:paginator] if source_rids.count == 1
+        paginator = options[:paginator]
 
-        records = apply_request_settings_to_records(records: records(options),
+        records = apply_request_settings_to_records(records: records_for_source_to_related(options),
                                resource_klass: resource_klass,
                                sort_criteria: sort_criteria,
                                primary_keys: source_ids,
@@ -387,6 +448,11 @@ module JSONAPI
           model_field = resource_klass.attribute_to_model_field(attribute)
           model_fields[attribute] = model_field
           pluck_fields << Arel.sql("#{concat_table_field(resource_table_alias, model_field[:name])} AS #{resource_table_alias}_#{model_field[:name]}")
+        end
+
+        sort_fields = options.dig(:_relation_helper_options, :sort_fields)
+        sort_fields.try(:each) do |field|
+          pluck_fields << Arel.sql(field)
         end
 
         fragments = {}
@@ -454,16 +520,16 @@ module JSONAPI
           end
         end
 
-        join_manager = JoinManager.new(resource_klass: self,
-                                    source_relationship: relationship,
-                                    relationships: linkage_relationships,
-                                    filters: filters)
+        join_manager = ActiveRelation::JoinManager.new(resource_klass: self,
+                                                       source_relationship: relationship,
+                                                       relationships: linkage_relationships,
+                                                       filters: filters)
 
-        paginator = options[:paginator] if source_rids.count == 1
+        paginator = options[:paginator]
 
         # Note: We will sort by the source table. Without using unions we can't sort on a polymorphic relationship
         # in any manner that makes sense
-        records = apply_request_settings_to_records(records: records(options),
+        records = apply_request_settings_to_records(records: records_for_source_to_related(options),
                                resource_klass: resource_klass,
                                sort_primary: true,
                                primary_keys: source_ids,
@@ -615,33 +681,32 @@ module JSONAPI
       end
 
       def apply_request_settings_to_records(records:,
-                       join_manager: JoinManager.new(resource_klass: self),
-                       resource_klass: self,
-                       filters: {},
-                       primary_keys: nil,
-                       sort_criteria: nil,
-                       sort_primary: nil,
-                       paginator: nil,
-                       options: {})
+                                            join_manager: ActiveRelation::JoinManager.new(resource_klass: self),
+                                            resource_klass: self,
+                                            filters: {},
+                                            primary_keys: nil,
+                                            sort_criteria: nil,
+                                            sort_primary: nil,
+                                            paginator: nil,
+                                            options: {})
 
-        opts = options.dup
-        records = resource_klass.apply_joins(records, join_manager, opts)
+        options[:_relation_helper_options] = { join_manager: join_manager, sort_fields: [] }
+
+        records = resource_klass.apply_joins(records, join_manager, options)
 
         if primary_keys
           records = records.where(_primary_key => primary_keys)
         end
 
-        opts[:join_manager] = join_manager
-
         unless filters.empty?
-          records = resource_klass.filter_records(records, filters, opts)
+          records = resource_klass.filter_records(records, filters, options)
         end
 
         if sort_primary
           records = records.order(_primary_key => :asc)
         else
           order_options = resource_klass.construct_order_options(sort_criteria)
-          records = resource_klass.sort_records(records, order_options, opts)
+          records = resource_klass.sort_records(records, order_options, options)
         end
 
         if paginator
@@ -675,12 +740,16 @@ module JSONAPI
 
         strategy = _allowed_sort.fetch(field.to_sym, {})[:apply]
 
+        options[:_relation_helper_options] ||= {}
+        options[:_relation_helper_options][:sort_fields] ||= []
+
         if strategy
           records = call_method_or_proc(strategy, records, direction, context)
         else
-          join_manager = options[:join_manager]
-
-          records = records.order(Arel.sql("#{get_aliased_field(field, join_manager)} #{direction}"))
+          join_manager = options.dig(:_relation_helper_options, :join_manager)
+          sort_field = join_manager ? get_aliased_field(field, join_manager) : field
+          options[:_relation_helper_options][:sort_fields].push("#{sort_field}")
+          records = records.order(Arel.sql("#{sort_field} #{direction}"))
         end
         records
       end
@@ -769,8 +838,9 @@ module JSONAPI
         if strategy
           records = call_method_or_proc(strategy, records, value, options)
         else
-          join_manager = options[:join_manager]
-          records = records.where(Arel.sql(get_aliased_field(filter, join_manager)) => value)
+          join_manager = options.dig(:_relation_helper_options, :join_manager)
+          field = join_manager ? get_aliased_field(filter, join_manager) : filter
+          records = records.where(Arel.sql(field) => value)
         end
 
         records
