@@ -6,8 +6,16 @@ end
 
 class PostsControllerTest < ActionController::TestCase
   def setup
+    super
     JSONAPI.configuration.raise_if_parameters_not_allowed = true
     JSONAPI.configuration.always_include_to_one_linkage_data = false
+  end
+
+  def test_links_include_relative_root
+    Rails.application.config.relative_url_root = '/subdir'
+    assert_cacheable_get :index
+    assert json_response['data'][0]['links']['self'].include?('/subdir')
+    Rails.application.config.relative_url_root = nil
   end
 
   def test_index
@@ -73,26 +81,40 @@ class PostsControllerTest < ActionController::TestCase
     assert_equal "All requests must use the '#{JSONAPI::MEDIA_TYPE}' Accept without media type parameters. This request specified '#{@request.headers['Accept']}'.", json_response['errors'][0]['detail']
   end
 
-  def test_exception_class_whitelist
-    original_whitelist = JSONAPI.configuration.exception_class_whitelist.dup
+  def test_exception_class_allowlist
+    original_allowlist = JSONAPI.configuration.exception_class_allowlist.dup
     $PostProcessorRaisesErrors = true
     # test that the operations dispatcher rescues the error when it
-    # has not been added to the exception_class_whitelist
+    # has not been added to the exception_class_allowlist
     assert_cacheable_get :index
     assert_response 500
 
     # test that the operations dispatcher does not rescue the error when it
-    # has been added to the exception_class_whitelist
-    JSONAPI.configuration.exception_class_whitelist << PostsController::SpecialError
+    # has been added to the exception_class_allowlist
+    JSONAPI.configuration.exception_class_allowlist << PostsController::SpecialError
     assert_cacheable_get :index
     assert_response 403
   ensure
     $PostProcessorRaisesErrors = false
-    JSONAPI.configuration.exception_class_whitelist = original_whitelist
+    JSONAPI.configuration.exception_class_allowlist = original_allowlist
+  end
+
+  def test_allow_all_exceptions
+    original_config = JSONAPI.configuration.allow_all_exceptions
+    $PostProcessorRaisesErrors = true
+    assert_cacheable_get :index
+    assert_response 500
+
+    JSONAPI.configuration.allow_all_exceptions = true
+    assert_cacheable_get :index
+    assert_response 403
+  ensure
+    $PostProcessorRaisesErrors = false
+    JSONAPI.configuration.allow_all_exceptions = original_config
   end
 
   def test_whitelist_all_exceptions
-    original_config = JSONAPI.configuration.whitelist_all_exceptions
+    original_config = JSONAPI.configuration.allow_all_exceptions
     $PostProcessorRaisesErrors = true
     assert_cacheable_get :index
     assert_response 500
@@ -106,18 +128,18 @@ class PostsControllerTest < ActionController::TestCase
   end
 
   def test_exception_added_to_request_env
-    original_config = JSONAPI.configuration.whitelist_all_exceptions
+    original_config = JSONAPI.configuration.allow_all_exceptions
     $PostProcessorRaisesErrors = true
     refute @request.env['action_dispatch.exception']
     assert_cacheable_get :index
     assert @request.env['action_dispatch.exception']
 
-    JSONAPI.configuration.whitelist_all_exceptions = true
+    JSONAPI.configuration.allow_all_exceptions = true
     assert_cacheable_get :index
     assert @request.env['action_dispatch.exception']
   ensure
     $PostProcessorRaisesErrors = false
-    JSONAPI.configuration.whitelist_all_exceptions = original_config
+    JSONAPI.configuration.allow_all_exceptions = original_config
   end
 
   def test_exception_includes_backtrace_when_enabled
@@ -160,7 +182,7 @@ class PostsControllerTest < ActionController::TestCase
 
   def test_on_server_error_block_callback_with_exception
     original_config = JSONAPI.configuration.dup
-    JSONAPI.configuration.exception_class_whitelist = []
+    JSONAPI.configuration.exception_class_allowlist = []
     $PostProcessorRaisesErrors = true
 
     @controller.class.instance_variable_set(:@callback_message, "none")
@@ -181,7 +203,7 @@ class PostsControllerTest < ActionController::TestCase
 
   def test_on_server_error_method_callback_with_exception
     original_config = JSONAPI.configuration.dup
-    JSONAPI.configuration.exception_class_whitelist = []
+    JSONAPI.configuration.exception_class_allowlist = []
     $PostProcessorRaisesErrors = true
 
     #ignores methods that don't exist
@@ -200,7 +222,7 @@ class PostsControllerTest < ActionController::TestCase
 
   def test_on_server_error_method_callback_with_exception_on_serialize
     original_config = JSONAPI.configuration.dup
-    JSONAPI.configuration.exception_class_whitelist = []
+    JSONAPI.configuration.exception_class_allowlist = []
     $PostSerializerRaisesErrors = true
 
     #ignores methods that don't exist
@@ -438,7 +460,7 @@ class PostsControllerTest < ActionController::TestCase
     assert_cacheable_get :index, params: {sort: 'title'}
 
     assert_response :success
-    assert_equal "A First Post", json_response['data'][0]['attributes']['title']
+    assert_equal "A 1ST Post", json_response['data'][0]['attributes']['title']
   end
 
   def test_sorting_desc
@@ -452,7 +474,7 @@ class PostsControllerTest < ActionController::TestCase
     assert_cacheable_get :index, params: {sort: 'title,body'}
 
     assert_response :success
-    assert_equal '14', json_response['data'][0]['id']
+    assert_equal '15', json_response['data'][0]['id']
   end
 
   def create_alphabetically_first_user_and_post
@@ -466,8 +488,15 @@ class PostsControllerTest < ActionController::TestCase
 
     assert_response :success
     assert json_response['data'].length > 10, 'there are enough records to show sort'
-    assert_equal '17', json_response['data'][0]['id'], 'nil is at the top'
-    assert_equal post.id.to_s, json_response['data'][1]['id'], 'alphabetically first user is second'
+
+    # Postgres sorts nulls last, whereas sqlite and mysql sort nulls first
+    if ENV['DATABASE_URL'].starts_with?('postgres')
+      assert_equal '17', json_response['data'][-1]['id'], 'nil is at the start'
+      assert_equal post.id.to_s, json_response['data'][0]['id'], 'alphabetically first user is not first'
+    else
+      assert_equal '17', json_response['data'][0]['id'], 'nil is at the end'
+      assert_equal post.id.to_s, json_response['data'][1]['id'], 'alphabetically first user is second'
+    end
   end
 
   def test_desc_sorting_by_relationship_field
@@ -476,8 +505,15 @@ class PostsControllerTest < ActionController::TestCase
 
     assert_response :success
     assert json_response['data'].length > 10, 'there are enough records to show sort'
-    assert_equal '17', json_response['data'][-1]['id'], 'nil is at the bottom'
-    assert_equal post.id.to_s, json_response['data'][-2]['id'], 'alphabetically first user is second last'
+
+    # Postgres sorts nulls last, whereas sqlite and mysql sort nulls first
+    if ENV['DATABASE_URL'].starts_with?('postgres')
+      assert_equal '17', json_response['data'][0]['id'], 'nil is at the start'
+      assert_equal post.id.to_s, json_response['data'][-1]['id']
+    else
+      assert_equal '17', json_response['data'][-1]['id'], 'nil is at the end'
+      assert_equal post.id.to_s, json_response['data'][-2]['id'], 'alphabetically first user is second last'
+    end
   end
 
   def test_sorting_by_relationship_field_include
@@ -486,8 +522,14 @@ class PostsControllerTest < ActionController::TestCase
 
     assert_response :success
     assert json_response['data'].length > 10, 'there are enough records to show sort'
-    assert_equal '17', json_response['data'][0]['id'], 'nil is at the top'
-    assert_equal post.id.to_s, json_response['data'][1]['id'], 'alphabetically first user is second'
+
+    if ENV['DATABASE_URL'].starts_with?('postgres')
+      assert_equal '17', json_response['data'][-1]['id'], 'nil is at the top'
+      assert_equal post.id.to_s, json_response['data'][0]['id']
+    else
+      assert_equal '17', json_response['data'][0]['id'], 'nil is at the top'
+      assert_equal post.id.to_s, json_response['data'][1]['id'], 'alphabetically first user is second'
+    end
   end
 
   def test_invalid_sort_param
@@ -1394,6 +1436,25 @@ class PostsControllerTest < ActionController::TestCase
     assert_response :no_content
     post_object = Post.find(3)
     assert_equal ruby.id, post_object.section_id
+  end
+
+  def test_remove_relationship_to_many_belongs_to
+    set_content_type_header!
+    c = Comment.find(3)
+    p = Post.find(2)
+    total_comment_count = Comment.count
+    post_comment_count = p.comments.count
+
+    put :destroy_relationship, params: {post_id: "#{p.id}", relationship: 'comments', data: [{type: 'comments', id: "#{c.id}"}]}
+
+    assert_response :no_content
+    p = Post.find(2)
+    c = Comment.find(3)
+
+    assert_equal post_comment_count - 1, p.comments.length
+    assert_equal total_comment_count, Comment.count
+
+    assert_nil c.post_id
   end
 
   def test_update_relationship_to_many_join_table_single
@@ -2751,6 +2812,51 @@ class BooksControllerTest < ActionController::TestCase
   end
 end
 
+class Api::V5::PostsControllerTest < ActionController::TestCase
+  def test_show_post_no_relationship_routes_exludes_relationships
+    assert_cacheable_get :show, params: {id: '1'}
+    assert_response :success
+    assert_nil json_response['data']['relationships']
+  end
+
+  def test_exclude_resource_links
+    assert_cacheable_get :show, params: {id: '1'}
+    assert_response :success
+    assert_nil json_response['data']['relationships']
+    assert_equal 1, json_response['data']['links'].length
+
+    Api::V5::PostResource.exclude_links :default
+    assert_cacheable_get :show, params: {id: '1'}
+    assert_response :success
+    assert_nil json_response['data']['relationships']
+    assert_nil json_response['data']['links']
+
+    Api::V5::PostResource.exclude_links [:self]
+    assert_cacheable_get :show, params: {id: '1'}
+    assert_response :success
+    assert_nil json_response['data']['relationships']
+    assert_nil json_response['data']['links']
+
+    Api::V5::PostResource.exclude_links :none
+    assert_cacheable_get :show, params: {id: '1'}
+    assert_response :success
+    assert_nil json_response['data']['relationships']
+    assert_equal 1, json_response['data']['links'].length
+  ensure
+    Api::V5::PostResource.exclude_links :none
+  end
+
+  def test_show_post_no_relationship_route_include
+    get :show, params: {id: '1', include: 'author'}
+    assert_response :success
+    assert_equal '1001', json_response['data']['relationships']['author']['data']['id']
+    assert_nil json_response['data']['relationships']['tags']
+    assert_equal '1001', json_response['included'][0]['id']
+    assert_equal 'people', json_response['included'][0]['type']
+    assert_equal 'joe@xyz.fake', json_response['included'][0]['attributes']['email']
+  end
+end
+
 class Api::V5::AuthorsControllerTest < ActionController::TestCase
   def test_get_person_as_author
     assert_cacheable_get :index, params: {filter: {id: '1001'}}
@@ -2950,12 +3056,16 @@ end
 
 class Api::V2::PreferencesControllerTest < ActionController::TestCase
   def test_show_singleton_resource_without_id
+    $test_user = Person.find(1001)
+
     assert_cacheable_get :show
     assert_response :success
   end
 
   def test_update_singleton_resource_without_id
     set_content_type_header!
+    $test_user = Person.find(1001)
+
     patch :update, params: {
       data: {
         id: "1",
@@ -3032,7 +3142,7 @@ class FactsControllerTest < ActionController::TestCase
     assert json_response['data'].is_a?(Hash)
     assert_equal 'Jane Author', json_response['data']['attributes']['spouseName']
     assert_equal 'First man to run across Antartica.', json_response['data']['attributes']['bio']
-    assert_equal 23.89/45.6, json_response['data']['attributes']['qualityRating']
+    assert_equal (23.89/45.6).round(5), json_response['data']['attributes']['qualityRating'].round(5)
     assert_equal '47000.56', json_response['data']['attributes']['salary']
     assert_equal '2013-08-07T20:25:00.000Z', json_response['data']['attributes']['dateTimeJoined']
     assert_equal '1965-06-30', json_response['data']['attributes']['birthday']
@@ -3557,6 +3667,29 @@ class Api::V2::BookCommentsControllerTest < ActionController::TestCase
   end
 end
 
+class Api::V4::PostsControllerTest < ActionController::TestCase
+  def test_warn_on_joined_to_many
+    original_config = JSONAPI.configuration.dup
+
+    JSONAPI.configuration.warn_on_performance_issues = true
+    _out, err = capture_subprocess_io do
+      get :index, params: {fields: {posts: 'id,title'}}
+      assert_response :success
+    end
+    assert_equal(err, "Performance issue detected: `Api::V4::PostResource.records` returned non-normalized results in `Api::V4::PostResource.find_fragments`.\n")
+
+    JSONAPI.configuration.warn_on_performance_issues = false
+    _out, err = capture_subprocess_io do
+      get :index, params: {fields: {posts: 'id,title'}}
+      assert_response :success
+    end
+    assert_empty err
+
+  ensure
+    JSONAPI.configuration = original_config
+  end
+end
+
 class Api::V4::BooksControllerTest < ActionController::TestCase
   def setup
     JSONAPI.configuration.json_key_format = :camelized_key
@@ -3881,6 +4014,16 @@ class Api::V7::CategoriesControllerTest < ActionController::TestCase
     assert_match /Internal Server Error/, json_response['errors'][0]['detail']
   end
 
+  def test_not_allowed_error_in_controller
+    original_config = JSONAPI.configuration.dup
+    JSONAPI.configuration.exception_class_allowlist = []
+    get :show, params: {id: '1'}
+    assert_response 500
+    assert_match /Internal Server Error/, json_response['errors'][0]['detail']
+  ensure
+    JSONAPI.configuration = original_config
+  end
+
   def test_not_whitelisted_error_in_controller
     original_config = JSONAPI.configuration.dup
     JSONAPI.configuration.exception_class_whitelist = []
@@ -3889,6 +4032,18 @@ class Api::V7::CategoriesControllerTest < ActionController::TestCase
     assert_match /Internal Server Error/, json_response['errors'][0]['detail']
   ensure
     JSONAPI.configuration = original_config
+  end
+
+  def test_allowed_error_in_controller
+    original_config = JSONAPI.configuration.dup
+    $PostProcessorRaisesErrors = true
+    JSONAPI.configuration.exception_class_allowlist = [PostsController::SubSpecialError]
+    assert_raises PostsController::SubSpecialError do
+      assert_cacheable_get :show, params: {id: '1'}
+    end
+  ensure
+    JSONAPI.configuration = original_config
+    $PostProcessorRaisesErrors = false
   end
 
   def test_whitelisted_error_in_controller
@@ -4609,7 +4764,12 @@ class RobotsControllerTest < ActionController::TestCase
     Robot.create! name: 'jane', version: 1
     assert_cacheable_get :index, params: {sort: 'name'}
     assert_response :success
-    assert_equal 'John', json_response['data'].first['attributes']['name']
+
+    if ENV['DATABASE_URL'].starts_with?('postgres')
+      assert_equal 'jane', json_response['data'].first['attributes']['name']
+    else
+      assert_equal 'John', json_response['data'].first['attributes']['name']
+    end
   end
 
   def test_fetch_robots_with_sort_by_lower_name
@@ -4626,5 +4786,36 @@ class RobotsControllerTest < ActionController::TestCase
     assert_cacheable_get :index, params: {sort: 'version'}
     assert_response 400
     assert_equal 'version is not a valid sort criteria for robots', json_response['errors'].first['detail']
+  end
+end
+
+class Api::V6::AuthorDetailsControllerTest < ActionController::TestCase
+  def after_teardown
+    Api::V6::AuthorDetailResource.paginator :none # TODO: ???
+  end
+
+  def test_that_the_last_two_author_details_belong_to_an_author
+    Api::V6::AuthorDetailResource.paginator :offset
+
+    total_count = AuthorDetail.count
+    assert_operator total_count, :>=, 2
+
+    assert_cacheable_get :index, params: {sort: :id, include: :author, page: {limit: 10, offset: total_count - 2}}
+    assert_response :success
+    assert_equal 2, json_response['data'].size
+    assert_not_nil json_response['data'][0]['relationships']['author']['data']
+    assert_not_nil json_response['data'][1]['relationships']['author']['data']
+  end
+
+  def test_that_the_last_author_detail_includes_its_author_even_if_returned_as_the_single_entry_on_a_page_with_nonzero_offset
+    Api::V6::AuthorDetailResource.paginator :offset
+
+    total_count = AuthorDetail.count
+    assert_operator total_count, :>=, 2
+
+    assert_cacheable_get :index, params: {sort: :id, include: :author, page: {limit: 10, offset: total_count - 1}}
+    assert_response :success
+    assert_equal 1, json_response['data'].size
+    assert_not_nil json_response['data'][0]['relationships']['author']['data']
   end
 end

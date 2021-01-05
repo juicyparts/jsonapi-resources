@@ -17,7 +17,7 @@ module JSONAPI
     end
 
     def has_errors?
-      @error_results.length > 0 || @global_errors.length > 0
+      @error_results.length.positive? || @global_errors.length.positive?
     end
 
     def add_result(result, operation)
@@ -118,10 +118,15 @@ module JSONAPI
         result.pagination_params.each_pair do |link_name, params|
           if result.is_a?(JSONAPI::RelatedResourcesSetOperationResult)
             relationship = result.source_resource.class._relationships[result._type.to_sym]
-            @top_level_links[link_name] = serializer.link_builder.relationships_related_link(result.source_resource, relationship, query_params(params))
+            unless relationship.exclude_link?(link_name)
+              link = serializer.link_builder.relationships_related_link(result.source_resource, relationship, query_params(params))
+            end
           else
-            @top_level_links[link_name] = serializer.query_link(query_params(params))
+            unless serializer.link_builder.primary_resource_klass.exclude_link?(link_name)
+              link = serializer.link_builder.query_link(query_params(params))
+            end
           end
+          @top_level_links[link_name] = link unless link.blank?
         end
       end
     end

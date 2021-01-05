@@ -47,7 +47,6 @@ module JSONAPI
             )
           )
         else
-          missed_resource_ids[resource_klass] ||= {}
           missed_resource_ids[resource_klass] = @resource_klasses[resource_klass].keys
         end
       end
@@ -91,7 +90,7 @@ module JSONAPI
       # Step Four find any of the missing resources and join them into the result
       missed_resource_ids.each_pair do |resource_klass, ids|
         find_opts = {context: context, fields: find_options[:fields]}
-        found_resources = resource_klass.find_by_keys(ids, find_opts)
+        found_resources = resource_klass.find_to_populate_by_keys(ids, find_opts)
 
         found_resources.each do |resource|
           relationship_data = @resource_klasses[resource_klass][resource.id][:relationships]
